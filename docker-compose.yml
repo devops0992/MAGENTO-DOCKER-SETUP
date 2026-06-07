@@ -1,0 +1,207 @@
+version: '3.8'
+
+services:
+  # NGINX - Reverse Proxy & TLS Termination
+  nginx:
+    build:
+      context: .
+      dockerfile: docker/nginx/Dockerfile
+    container_name: magento-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./docker/nginx/vhost.conf:/etc/nginx/conf.d/default.conf:ro
+      - magento-data:/var/www/html:cached
+      - magento-media:/var/www/html/pub/media:cached
+      - magento-static:/var/www/html/pub/static:cached
+      - ./certs:/etc/nginx/certs:ro
+    environment:
+      - TZ=UTC
+    depends_on:
+      - varnish
+    networks:
+      - magento-network
+    restart: unless-stopped
+    user: "${TEST_USER_ID}:${TEST_GROUP_ID}"
+
+  # Varnish - Full Page Cache
+  varnish:
+    image: varnish:7.5-alpine
+    container_name: magento-varnish
+    ports:
+      - "6081:6081"
+    volumes:
+      - ./docker/varnish/default.vcl:/etc/varnish/default.vcl:ro
+    environment:
+      - VARNISH_CONFIG=/etc/varnish/default.vcl
+      - VARNISH_STORAGE=malloc,256m
+    depends_on:
+      - php-fpm
+    networks:
+      - magento-network
+    restart: unless-stopped
+
+  # PHP-FPM - Magento Application
+  php-fpm:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        MAGENTO_VERSION: 2.4.6
+    container_name: magento-php-fpm
+    volumes:
+      - magento-data:/var/www/html:delegated
+      - magento-media:/var/www/html/pub/media:delegated
+      - magento-static:/var/www/html/pub/static:delegated
+      - magento-var:/var/www/html/var:delegated
+      - magento-generated:/var/www/html/generated:delegated
+      - ./docker/php-fpm/www.conf:/usr/local/etc/php-fpm.d/www.conf:ro
+      - ./docker/php-fpm/php.ini:/usr/local/etc/php/conf.d/magento.ini:ro
+    environment:
+      - MYSQL_HOST=mysql
+      - MYSQL_USER=${MYSQL_USER}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
+      - MYSQL_DATABASE=${MYSQL_DATABASE}
+      - ELASTICSEARCH_HOST=elasticsearch
+      - ELASTICSEARCH_PORT=9200
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_CACHE_DB=0
+      - REDIS_PAGE_CACHE_DB=1
+      - REDIS_SESSION_DB=2
+      - MAGENTO_BASE_URL=https://test.dyna.com/
+      - MAGENTO_BASE_SECURE_URL=https://test.dyna.com/
+      - MAGENTO_ADMIN_FRONTNAME=${MAGENTO_ADMIN_FRONTNAME}
+      - TZ=UTC
+    depends_on:
+      - mysql
+      - redis
+      - elasticsearch
+    networks:
+      - magento-network
+    restart: unless-stopped
+    user: "${TEST_USER_ID}:${TEST_GROUP_ID}"
+
+  # Cron Container - Magento Cron Jobs
+  cron:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        MAGENTO_VERSION: 2.4.6
+    container_name: magento-cron
+    volumes:
+      - magento-data:/var/www/html:delegated
+      - magento-media:/var/www/html/pub/media:delegated
+      - magento-static:/var/www/html/pub/static:delegated
+      - magento-var:/var/www/html/var:delegated
+      - magento-generated:/var/www/html/generated:delegated
+      - ./docker/php-fpm/php.ini:/usr/local/etc/php/conf.d/magento.ini:ro
+    environment:
+      - MYSQL_HOST=mysql
+      - MYSQL_USER=${MYSQL_USER}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
+      - MYSQL_DATABASE=${MYSQL_DATABASE}
+      - ELASTICSEARCH_HOST=elasticsearch
+      - ELASTICSEARCH_PORT=9200
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_CACHE_DB=0
+      - REDIS_PAGE_CACHE_DB=1
+      - REDIS_SESSION_DB=2
+      - TZ=UTC
+    working_dir: /var/www/html
+    command: sh -c "while true; do php bin/magento cron:run; sleep 60; done"
+    depends_on:
+      - mysql
+      - redis
+      - elasticsearch
+    networks:
+      - magento-network
+    restart: unless-stopped
+    user: "${TEST_USER_ID}:${TEST_GROUP_ID}"
+
+  # MySQL Database
+  mysql:
+    image: mysql:8.0
+    container_name: magento-mysql
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
+      - MYSQL_DATABASE=${MYSQL_DATABASE}
+      - MYSQL_USER=${MYSQL_USER}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
+      - TZ=UTC
+    volumes:
+      - mysql-data:/var/lib/mysql
+    networks:
+      - magento-network
+    restart: unless-stopped
+    command: --default-authentication-plugin=mysql_native_password --max_allowed_packet=256M --sql-mode=""
+
+  # Elasticsearch
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.0.0
+    container_name: magento-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+      - xpack.security.enabled=false
+      - TZ=UTC
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    networks:
+      - magento-network
+    restart: unless-stopped
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: magento-redis
+    volumes:
+      - redis-data:/data
+    networks:
+      - magento-network
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+
+  # phpMyAdmin
+  phpmyadmin:
+    image: phpmyadmin:5.2-apache
+    container_name: magento-phpmyadmin
+    environment:
+      - PMA_HOST=mysql
+      - PMA_USER=${MYSQL_USER}
+      - PMA_PASSWORD=${MYSQL_PASSWORD}
+      - TZ=UTC
+    volumes:
+      - phpmyadmin-sessions:/sessions
+    networks:
+      - magento-network
+    restart: unless-stopped
+    user: "${TEST_USER_ID}:${TEST_GROUP_ID}"
+
+networks:
+  magento-network:
+    driver: bridge
+
+volumes:
+  magento-data:
+    driver: local
+  magento-media:
+    driver: local
+  magento-static:
+    driver: local
+  magento-var:
+    driver: local
+  magento-generated:
+    driver: local
+  mysql-data:
+    driver: local
+  elasticsearch-data:
+    driver: local
+  redis-data:
+    driver: local
+  phpmyadmin-sessions:
+    driver: local
