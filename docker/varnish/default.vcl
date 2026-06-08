@@ -1,137 +1,134 @@
 vcl 4.1;
 
-import std;
-
+# Varnish backend = internal NGINX (HTTP, port 8080)
 backend default {
-    .host = "php-fpm";
-    .port = "9000";
+    .host = "nginx";
+    .port = "8080";
+    .connect_timeout = 60s;
     .first_byte_timeout = 300s;
-    .connect_timeout = 5s;
-    .between_bytes_timeout = 300s;
+    .between_bytes_timeout = 60s;
 }
+
+import std;
 
 acl purge {
     "localhost";
     "127.0.0.1";
-    "172.0.0.0/8";
+    "nginx";
+    "php-fpm";
+    "10.0.0.0/8";
+    "172.16.0.0/12";
+    "192.168.0.0/16";
 }
 
 sub vcl_recv {
-    # Normalize host header
-    if (req.http.host ~ "(?i)^(www\.)?test\.dyna\.com$") {
-        set req.http.host = "test.dyna.com";
-    }
-
-    # Health check
-    if (req.url == "/health.check") {
-        return (synth(200, "OK"));
-    }
-
-    # PURGE method
+    # Handle PURGE requests
     if (req.method == "PURGE") {
         if (!client.ip ~ purge) {
-            return (synth(403, "Purge not allowed"));
+            return (synth(405, "Method not allowed"));
         }
         return (purge);
     }
 
-    # Only cache GET and HEAD requests
+    # Ban
+    if (req.method == "BAN") {
+        if (!client.ip ~ purge) {
+            return (synth(405, "Method not allowed"));
+        }
+        ban("obj.http.X-Tags ~ " + req.http.X-Ban-Tags);
+        return (synth(200, "Banned"));
+    }
+
+    # Only cache GET and HEAD
     if (req.method != "GET" && req.method != "HEAD") {
         return (pass);
     }
 
-    # Pass through if authorization header is present
-    if (req.http.Authorization) {
+    # Don't cache admin
+    if (req.url ~ "^/index.php/admin" || req.url ~ "^/admin") {
         return (pass);
     }
 
-    # Skip caching for admin URLs
-    if (req.url ~ "^/(admin|api)" || req.http.Cookie ~ "adminhtml") {
+    # Don't cache checkout, customer account
+    if (req.url ~ "^/(checkout|customer|account|wishlist|cart|compare|review)" ) {
         return (pass);
     }
 
-    # Skip caching for certain URL patterns
-    if (req.url ~ "^/checkout" || 
-        req.url ~ "^/customer" ||
-        req.url ~ "^/account" ||
-        req.url ~ "^/sales" ||
-        req.url ~ "\?") {
+    # Don't cache if cookie contains logged-in session
+    if (req.http.cookie ~ "adminhtml=") {
         return (pass);
     }
 
-    # Remove cookies for static content
-    if (req.url ~ "(?i)\.(jpg|jpeg|png|gif|css|js|woff|woff2|ttf|svg|eot|ico)$") {
-        unset req.http.Cookie;
+    # Magento no-cache cookie
+    if (req.http.cookie ~ "no_cache=1") {
+        return (pass);
     }
+
+    # Strip marketing/analytics query params to improve cache hit rate
+    set req.url = regsuball(req.url, "(^|&)(utm_source|utm_medium|utm_campaign|utm_content|utm_term|gclid|fbclid)=[^&]*", "");
+    set req.url = regsub(req.url, "^([^?]*)\?$", "\1");
 
     return (hash);
 }
 
 sub vcl_hash {
     hash_data(req.url);
-    hash_data(req.http.host);
-    
-    # Hash based on cookie for user-specific content
-    if (req.http.Cookie ~ "customer") {
-        hash_data(req.http.Cookie);
+
+    if (req.http.host) {
+        hash_data(req.http.host);
+    } else {
+        hash_data(server.ip);
     }
+
+    # Vary cache by currency/store cookie if present
+    if (req.http.cookie ~ "currency=") {
+        hash_data(regsub(req.http.cookie, ".*currency=([^;]+).*", "\1"));
+    }
+    if (req.http.cookie ~ "store=") {
+        hash_data(regsub(req.http.cookie, ".*store=([^;]+).*", "\1"));
+    }
+
+    return (lookup);
 }
 
 sub vcl_backend_response {
-    # Set default cache time to 1 hour
-    if (beresp.ttl <= 0s || beresp.http.Set-Cookie || beresp.http.Pragma ~ "no-cache" ||
-        beresp.http.Cache-Control ~ "no-cache|private") {
+    # Cache 404s briefly to reduce backend load
+    if (beresp.status == 404) {
+        set beresp.ttl = 30s;
+        set beresp.grace = 10s;
+        return (deliver);
+    }
+
+    # Don't cache 5xx errors
+    if (beresp.status >= 500) {
         set beresp.ttl = 0s;
-        set beresp.uncacheable = true;
-    } else {
+        return (deliver);
+    }
+
+    # Strip cookies from cacheable responses
+    if (beresp.http.cache-control !~ "private" && beresp.http.cache-control !~ "no-cache") {
+        unset beresp.http.set-cookie;
         set beresp.ttl = 1h;
+        set beresp.grace = 30m;
     }
-
-    # Cache 404 and 301 responses
-    if (beresp.status == 404 || beresp.status == 301 || beresp.status == 302) {
-        set beresp.ttl = 1h;
-    }
-
-    # Set cache time for static assets to 24 hours
-    if (bereq.url ~ "(?i)\.(jpg|jpeg|png|gif|css|js|woff|woff2|ttf|svg|eot|ico)$") {
-        set beresp.ttl = 24h;
-    }
-
-    # Add debug header
-    set beresp.http.X-Magento-Cache-Debug = "HIT";
 
     return (deliver);
 }
 
-sub vcl_hit {
-    set resp.http.X-Magento-Cache-Debug = "HIT";
-}
-
-sub vcl_miss {
-    set resp.http.X-Magento-Cache-Debug = "MISS";
-}
-
-sub vcl_pass {
-    set resp.http.X-Magento-Cache-Debug = "PASS";
-}
-
 sub vcl_deliver {
-    # Ensure the cache debug header is present
-    if (resp.http.X-Magento-Cache-Debug) {
-        # Already set
+    # Add HIT/MISS debug header
+    if (obj.hits > 0) {
+        set resp.http.X-Magento-Cache-Debug = "HIT";
+        set resp.http.X-Cache-Hits = obj.hits;
     } else {
-        set resp.http.X-Magento-Cache-Debug = "UNCACHEABLE";
+        set resp.http.X-Magento-Cache-Debug = "MISS";
     }
 
-    # Remove server info for security
-    unset resp.http.Server;
+    # Remove internal headers
     unset resp.http.X-Powered-By;
-}
+    unset resp.http.Server;
+    unset resp.http.X-Varnish;
+    unset resp.http.Via;
 
-sub vcl_synth {
-    if (resp.status == 200) {
-        set resp.http.Content-Type = "text/plain; charset=utf-8";
-        set resp.body = "Varnish is running";
-        return (deliver);
-    }
+    return (deliver);
 }
