@@ -1,3 +1,36 @@
+# 1. Create a 4 GB swap file (dd is slower but compatible everywhere)
+sudo fallocate -l 4G /swapfile
+# If fallocate fails (some filesystems), use dd instead:
+# sudo dd if=/dev/zero of=/swapfile bs=1M count=4096
+
+# 2. Secure the swap file — only root should read/write it
+sudo chmod 600 /swapfile
+
+# 3. Set up the Linux swap area
+sudo mkswap /swapfile
+
+# 4. Activate swap immediately
+sudo swapon /swapfile
+
+# 5. Verify swap is active
+free -h
+# You should see ~4.0G in the Swap row
+
+swapon --show
+# NAME      TYPE  SIZE   USED PRIO
+# /swapfile file 4096M  0B   -2
+
+# Temporarily (until next reboot)
+sudo sysctl vm.swappiness=10
+
+# Permanently — add to /etc/sysctl.conf
+echo 'vm.swappiness=10' | sudo tee -a /etc/sysctl.conf
+echo 'vm.vfs_cache_pressure=50' | sudo tee -a /etc/sysctl.conf
+
+# Apply immediately without reboot
+sudo sysctl -p
+
+
 # Magento 2.4.6 Dockerized Infrastructure on AWS
 
 ## Overview
